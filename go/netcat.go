@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"sync/atomic"
+	"time"
 )
 
 var (
@@ -13,7 +15,24 @@ var (
 	dialAddress = flag.String("-c","0.0.0.0:19999", "connect server address" )
 )
 
+var mesure uint64
+
 func runServer() {
+	go func() {
+		for {
+			// 每秒测量一次吞吐
+			now := time.Now()
+			time.Sleep(time.Second)
+			elapsed := time.Since(now)
+			nBytes := atomic.LoadUint64(&mesure)
+			atomic.StoreUint64(&mesure, 0)
+			if nBytes > 0 {
+				mib :=  float64(nBytes) / (1024.0 * 1024) / elapsed.Seconds()
+				log.Printf("%.3f MiB/s\n",mib);
+			}
+		}
+	}()
+
 	ln, err := net.Listen("tcp", *serverAddress)
 	if err != nil {
 		log.Fatal(err)
@@ -44,6 +63,9 @@ func runServer() {
 					panic(err)
 				}
 
+				// write socket mesure
+				atomic.AddUint64(&mesure, uint64(nw))
+
 				if nw != nr {
 					log.Printf("write stdin -> socket failed, write socket: %d bytes, read stdin: %d bytes",
 						nw, nr)
@@ -65,6 +87,9 @@ func runServer() {
 					panic(err)
 				}
 
+				// read socket mesure
+				atomic.AddUint64(&mesure, uint64(nr))
+
 				nw, err := os.Stdout.Write(buf[:nr])
 				if err != nil {
 					panic(err)
@@ -85,6 +110,7 @@ func runClient()  {
 }
 
 func main() {
+	atomic.StoreUint64(&mesure, 0)
 	if *serverAddress != "" {
 		runServer()
 	} else if *dialAddress != "" {
