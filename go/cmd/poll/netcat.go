@@ -15,8 +15,9 @@ import (
 )
 
 var (
-	serverAddress = flag.String("l", "0.0.0.0:19999", "start server address")
-	// dialAddress   = flag.String("-c", "0.0.0.0:19999", "connect server address")
+	serverAddress = flag.String("l", "", "start server address")
+	dialAddress   = flag.String("c", "", "connect server address")
+	chargen       = flag.Bool("chargen", false, "closed server read client, client may block in write")
 )
 
 var mesure uint64
@@ -65,7 +66,7 @@ func runServer(host string, port int) error {
 
 	ip4 := ipAddr.IP.To4()
 	if len(ip4) != net.IPv4len {
-		return fmt.Errorf("invalid ipv4 value")
+		return fmt.Errorf("only ipv4 address")
 	}
 
 	serverFd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
@@ -136,7 +137,7 @@ func runServer(host string, port int) error {
 				}
 
 			} else {
-				if pollFds[i].Revents&unix.POLLIN == unix.POLLIN {
+				if *chargen == false && pollFds[i].Revents&unix.POLLIN == unix.POLLIN {
 					nr, err := unix.Read(int(pollFds[i].Fd), outBuf)
 					if err != nil {
 						log.Printf("read %d client error: %s", pollFds[i].Fd, err.Error())
@@ -164,8 +165,99 @@ func runServer(host string, port int) error {
 
 }
 
-func main() {
+func runClient(host string, port int) error {
+	fmt.Println("run client")
+	ipAddr, err := net.ResolveIPAddr("ip", host)
+	if err != nil {
+		return err
+	}
 
+	ip4 := ipAddr.IP.To4()
+	if len(ip4) != net.IPv4len {
+		return fmt.Errorf("only ipv4 address")
+	}
+
+	serverFd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sa := unix.SockaddrInet4{
+		Port: port,
+		Addr: [4]byte{ipAddr.IP[0], ipAddr.IP[1], ipAddr.IP[2], ipAddr.IP[3]},
+	}
+
+	if err = unix.Connect(serverFd, &sa); err != nil {
+		return err
+	}
+
+	pollFds := make([]unix.PollFd, 0)
+
+	pollFds = append(pollFds,
+		unix.PollFd{
+			Fd:      int32(serverFd),
+			Events:  unix.POLLIN,
+			Revents: -1,
+		},
+		unix.PollFd{
+			Fd:      int32(unix.Stdin),
+			Events:  unix.POLLIN,
+			Revents: -1,
+		})
+
+	inToSocketBuf := make([]byte, 4096)
+	socketToInBuf := make([]byte, 4096)
+	for {
+		nReady, err := unix.Poll(pollFds, -1)
+		if err != nil {
+			panic(err)
+		}
+
+		for i := 0; i < len(pollFds); i++ {
+			if pollFds[i].Fd == int32(serverFd) {
+				if pollFds[i].Revents&unix.POLLIN == unix.POLLIN {
+					fmt.Println("server is reading")
+					nr, err := unix.Read(serverFd, socketToInBuf)
+					if err != nil {
+						log.Printf("read server error: %s", err.Error())
+						continue
+					}
+
+					if nr == 0 {
+						unix.Close(serverFd)
+						log.Fatalf("read but server closed")
+					}
+
+					os.Stdout.Write(socketToInBuf[:nr])
+
+					if nReady--; nReady <= 0 {
+						break
+					}
+				}
+
+			} else if pollFds[i].Fd == int32(unix.Stdin) {
+				nr, err := unix.Read(unix.Stdin, inToSocketBuf)
+				if err != nil {
+					log.Printf("read server error: %s", err.Error())
+					continue
+				}
+
+				if nr > 0 {
+					_, err := unix.Write(serverFd, inToSocketBuf[:nr])
+					if err != nil && err == unix.EPIPE {
+						unix.Close(serverFd)
+						log.Fatalf("write buf server closed")
+					}
+				}
+
+			}
+		}
+	}
+
+	return nil
+}
+
+func main() {
 	flag.Parse()
 	atomic.StoreUint64(&mesure, 0)
 
@@ -197,6 +289,17 @@ func main() {
 		}
 
 		log.Println(runServer(sep[0], port))
+	} else if *dialAddress != "" {
+		sep := strings.Split(*dialAddress, ":")
+		if len(sep) != 2 {
+			log.Fatal("invalid address")
+		}
+
+		port, err := strconv.Atoi(sep[1])
+		if err != nil {
+			log.Fatalf("strconv.Atoid port failed: %s", err.Error())
+		}
+		runClient(sep[0], port)
 	}
 
 }
