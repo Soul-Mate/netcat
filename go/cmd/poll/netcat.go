@@ -229,7 +229,7 @@ func runClient(host string, port int) error {
 					}
 
 					os.Stdout.Write(socketToInBuf[:nr])
-
+					time.Sleep(time.Second * 5) // 模拟接收方慢速接收
 					if nReady--; nReady <= 0 {
 						break
 					}
