@@ -21,6 +21,14 @@ var (
 
 var mesure uint64
 
+func unregisterPollFd(pollFds *[]unix.PollFd, i int) {
+	if i+1 < len(*pollFds) {
+		*pollFds = append((*pollFds)[:i], (*pollFds)[i+1:]...)
+	} else {
+		*pollFds = (*pollFds)[:i]
+	}
+}
+
 func writeAllClient(pollFds *[]unix.PollFd, serverFd int32, buf []byte, n int) {
 	for i := 0; i < len(*pollFds); i++ {
 		if (*pollFds)[i].Fd == serverFd || (*pollFds)[i].Fd == int32(unix.Stdin) {
@@ -34,11 +42,7 @@ func writeAllClient(pollFds *[]unix.PollFd, serverFd int32, buf []byte, n int) {
 				if err == unix.EPIPE {
 					log.Printf("write to %d cliend error: %s", (*pollFds)[i].Fd, err.Error())
 					// unregister
-					if i+1 < len(*pollFds) {
-						*pollFds = append((*pollFds)[:i], (*pollFds)[i+1:]...)
-					} else {
-						*pollFds = (*pollFds)[:i]
-					}
+					unregisterPollFd(pollFds, i)
 					fmt.Println(*pollFds)
 					continue
 				}
@@ -111,9 +115,8 @@ func runServer(host string, port int) error {
 				}
 
 				pollFds = append(pollFds, unix.PollFd{
-					Fd: int32(connFd),
-					// Events: unix.POLLIN | unix.POLLOUT,
-					Events: unix.POLLOUT,
+					Fd:     int32(connFd),
+					Events: unix.POLLIN | unix.POLLOUT,
 				})
 
 				fmt.Println(pollFds)
@@ -136,11 +139,14 @@ func runServer(host string, port int) error {
 				if pollFds[i].Revents&unix.POLLIN == unix.POLLIN {
 					nr, err := unix.Read(int(pollFds[i].Fd), outBuf)
 					if err != nil {
-						panic(err)
+						log.Printf("read %d client error: %s", pollFds[i].Fd, err.Error())
+						unregisterPollFd(&pollFds, i)
+						continue
 					}
 
 					if nr == 0 {
-						log.Printf("client closed")
+						log.Printf("client %d closed", pollFds[i].Fd)
+						unregisterPollFd(&pollFds, i)
 						continue
 					}
 
@@ -159,6 +165,7 @@ func runServer(host string, port int) error {
 }
 
 func main() {
+
 	flag.Parse()
 	atomic.StoreUint64(&mesure, 0)
 
