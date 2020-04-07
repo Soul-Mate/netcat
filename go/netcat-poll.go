@@ -21,20 +21,31 @@ var (
 
 var mesure uint64
 
-func writeAllClient(pollFds []unix.PollFd, serverFd int32, buf []byte, n int) {
-	for i := 0; i < len(pollFds); i++ {
-		if pollFds[i].Fd == serverFd || pollFds[i].Fd == int32(unix.Stdin) {
+func writeAllClient(pollFds *[]unix.PollFd, serverFd int32, buf []byte, n int) {
+	for i := 0; i < len(*pollFds); i++ {
+		if (*pollFds)[i].Fd == serverFd || (*pollFds)[i].Fd == int32(unix.Stdin) {
 			continue
 		}
 
-		if pollFds[i].Revents&unix.POLLOUT == unix.POLLOUT {
-			nw, err := unix.Write(int(pollFds[i].Fd), buf[:n])
+		if (*pollFds)[i].Revents&unix.POLLOUT == unix.POLLOUT {
+			nw, err := unix.Write(int((*pollFds)[i].Fd), buf[:n])
 			if err != nil {
-				panic(err)
+				// client closed
+				if err == unix.EPIPE {
+					log.Printf("write to %d cliend error: %s", (*pollFds)[i].Fd, err.Error())
+					// unregister
+					if i+1 < len(*pollFds) {
+						*pollFds = append((*pollFds)[:i], (*pollFds)[i+1:]...)
+					} else {
+						*pollFds = (*pollFds)[:i]
+					}
+					fmt.Println(*pollFds)
+					continue
+				}
 			}
 
 			if nw != n {
-				log.Printf("write to %d client failed, need write %d, write %d", pollFds[i].Fd, n, nw)
+				log.Printf("write to %d client failed, need write %d, write %d", (*pollFds)[i].Fd, n, nw)
 			}
 
 			atomic.AddUint64(&mesure, uint64(nw))
@@ -92,7 +103,6 @@ func runServer(host string, port int) error {
 		if err != nil {
 			panic(err)
 		}
-
 		for i := 0; i < len(pollFds); i++ {
 			if pollFds[i].Fd == int32(serverFd) && pollFds[i].Revents&unix.POLLIN == 1 {
 				connFd, _, err := unix.Accept(serverFd)
@@ -117,9 +127,7 @@ func runServer(host string, port int) error {
 				if err != nil {
 					panic(err)
 				}
-
-				writeAllClient(pollFds, int32(serverFd), inBuf, nr)
-
+				writeAllClient(&pollFds, int32(serverFd), inBuf, nr)
 				if nReady--; nReady == 0 {
 					break
 				}
