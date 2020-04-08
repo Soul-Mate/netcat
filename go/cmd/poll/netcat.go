@@ -216,7 +216,6 @@ func runClient(host string, port int) error {
 		for i := 0; i < len(pollFds); i++ {
 			if pollFds[i].Fd == int32(serverFd) {
 				if pollFds[i].Revents&unix.POLLIN == unix.POLLIN {
-					fmt.Println("server is reading")
 					nr, err := unix.Read(serverFd, socketToInBuf)
 					if err != nil {
 						log.Printf("read server error: %s", err.Error())
@@ -229,7 +228,8 @@ func runClient(host string, port int) error {
 					}
 
 					os.Stdout.Write(socketToInBuf[:nr])
-					time.Sleep(time.Second * 5) // 模拟接收方慢速接收
+
+					// time.Sleep(time.Second * 2) // 模拟接收方慢速接收
 					if nReady--; nReady <= 0 {
 						break
 					}

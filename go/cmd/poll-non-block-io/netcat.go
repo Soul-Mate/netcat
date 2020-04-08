@@ -72,7 +72,6 @@ func runServer(ipv4 [4]byte, port int) error {
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	sa := unix.SockaddrInet4{
 		Port: port,
 		Addr: ipv4,
@@ -99,78 +98,108 @@ func runServer(ipv4 [4]byte, port int) error {
 			Revents: -1,
 		})
 
+	nr, nw := 0, 0
 	outBuf := make([]byte, 4096)
-	inBuf := make([]byte, 4096)
+	inToSocketBuf := make([]byte, 4096)
+	// todo test
+	go func() {
+		time.Sleep(time.Second * 20)
+		*chargen = false
+		fmt.Println(*chargen)
+	}()
 	for {
-		nReady, err := unix.Poll(pollFds, -1)
+		nReady, err := unix.Poll(pollFds, 1000) // 500ms
 		if err != nil {
 			panic(err)
 		}
-		for i := 0; i < len(pollFds); i++ {
-			if pollFds[i].Fd == int32(serverFd) && pollFds[i].Revents&unix.POLLIN == 1 {
-				connFd, _, err := unix.Accept(serverFd)
+		// accept new connection
+		if pollFds[0].Revents&unix.POLLIN == unix.POLLIN {
+			connFd, _, err := unix.Accept(serverFd)
+			if err != nil {
+				panic(err)
+			}
+
+			pollFds = append(pollFds, unix.PollFd{
+				Fd:     int32(connFd),
+				Events: unix.POLLIN | unix.POLLOUT,
+			})
+
+			// set non blocking
+			if _, err = util.SetNonBlocking(connFd); err != nil {
+				log.Println(err)
+				syscall.Close(connFd)
+				continue
+			}
+
+			if nReady--; nReady <= 0 {
+				continue
+			}
+		}
+
+		if pollFds[1].Revents&unix.POLLIN == unix.POLLIN {
+			if nr, err = os.Stdin.Read(inToSocketBuf); err != nil {
+				panic(err)
+			}
+
+			if nReady--; nReady <= 0 {
+				continue
+			}
+		}
+
+		for i := 2; i < len(pollFds); i++ {
+			if *chargen == false && pollFds[i].Revents&unix.POLLIN == unix.POLLIN {
+				nr, err := unix.Read(int(pollFds[i].Fd), outBuf)
 				if err != nil {
-					panic(err)
-				}
-
-				pollFds = append(pollFds, unix.PollFd{
-					Fd:     int32(connFd),
-					Events: unix.POLLIN | unix.POLLOUT,
-				})
-
-				// set non blocking
-				if _, err = util.SetNonBlocking(connFd); err != nil {
-					log.Println(err)
-					syscall.Close(connFd)
+					log.Printf("read %d client error: %s", pollFds[i].Fd, err.Error())
+					unregisterPollFd(&pollFds, i)
 					continue
 				}
 
-				if nReady--; nReady == 0 {
-					break
+				if nr == 0 {
+					log.Printf("client %d closed", pollFds[i].Fd)
+					unregisterPollFd(&pollFds, i)
+					continue
 				}
 
-			} else if pollFds[i].Fd == int32(unix.Stdin) && pollFds[i].Revents&unix.POLLIN == 1 {
-				nr, err := unix.Read(unix.Stdin, inBuf)
-				if err != nil {
-					panic(err)
-				}
+				mesure.Add(uint64(nr))
 
-				writeAllClient(&pollFds, int32(serverFd), inBuf, nr)
-				if nReady--; nReady == 0 {
-					break
-				}
+				os.Stdout.Write(outBuf[:nr])
+			}
 
-			} else {
-				if *chargen == false && pollFds[i].Revents&unix.POLLIN == unix.POLLIN {
-					nr, err := unix.Read(int(pollFds[i].Fd), outBuf)
-					if err != nil {
-						log.Printf("read %d client error: %s", pollFds[i].Fd, err.Error())
-						unregisterPollFd(&pollFds, i)
-						continue
+			if pollFds[i].Revents&unix.POLLOUT == unix.POLLOUT {
+				if nr >= 0 {
+					if nw, err = unix.Write(int(pollFds[i].Fd), inToSocketBuf[:nr]); err != nil {
+						// client closed
+						if err == unix.EPIPE {
+							log.Printf("write to %d cliend error: %s", pollFds[i].Fd, err.Error())
+							// unregister
+							unregisterPollFd(&pollFds, i)
+							continue
+						}
+
+						// operation would block
+						if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+							// register pollout
+							// unregister pollin
+							log.Printf("write to %d client wolud blocked", pollFds[i].Fd)
+							continue
+						}
 					}
 
-					if nr == 0 {
-						log.Printf("client %d closed", pollFds[i].Fd)
-						unregisterPollFd(&pollFds, i)
-						continue
-					}
+					mesure.Add(uint64(nw))
 
-					mesure.Add(uint64(nr))
-
-					os.Stdout.Write(outBuf[:nr])
-
-					if nReady--; nReady == 0 {
-						break
+					if nw != nr {
+						log.Printf("write to %d client failed, need write %d, write %d", pollFds[i].Fd, nr, nw)
 					}
 				}
 			}
 		}
 	}
 
+	return nil
 }
 
 func runClient(host string, port int) error {
-	fmt.Println("run client")
 	ipAddr, err := net.ResolveIPAddr("ip", host)
 	if err != nil {
 		return err
@@ -209,52 +238,84 @@ func runClient(host string, port int) error {
 			Revents: -1,
 		})
 
+	// set non blocking io
+	if _, err = util.SetNonBlocking(serverFd); err != nil {
+		return err
+	}
+
 	inToSocketBuf := make([]byte, 4096)
 	socketToInBuf := make([]byte, 4096)
+	writeBuffer := make([]byte, 0, 0)
+
 	for {
-		nReady, err := unix.Poll(pollFds, -1)
+		nReady, err := unix.Poll(pollFds, 1000)
 		if err != nil {
 			panic(err)
 		}
 
-		for i := 0; i < len(pollFds); i++ {
-			if pollFds[i].Fd == int32(serverFd) {
-				if pollFds[i].Revents&unix.POLLIN == unix.POLLIN {
-					fmt.Println("server is reading")
-					nr, err := unix.Read(serverFd, socketToInBuf)
-					if err != nil {
-						log.Printf("read server error: %s", err.Error())
-						continue
-					}
-
-					if nr == 0 {
-						unix.Close(serverFd)
-						log.Fatalf("read but server closed")
-					}
-
-					os.Stdout.Write(socketToInBuf[:nr])
-
-					if nReady--; nReady <= 0 {
-						break
-					}
-				}
-
-			} else if pollFds[i].Fd == int32(unix.Stdin) {
-				nr, err := unix.Read(unix.Stdin, inToSocketBuf)
-				if err != nil {
-					log.Printf("read server error: %s", err.Error())
-					continue
-				}
-
-				if nr > 0 {
-					_, err := unix.Write(serverFd, inToSocketBuf[:nr])
-					if err != nil && err == unix.EPIPE {
-						unix.Close(serverFd)
-						log.Fatalf("write buf server closed")
-					}
-				}
-
+		fmt.Println(nReady)
+		// server is read
+		if pollFds[0].Revents&unix.POLLIN == unix.POLLIN {
+			nr, err := unix.Read(serverFd, socketToInBuf)
+			if err != nil {
+				log.Printf("read server error: %s", err.Error())
+				continue
 			}
+
+			if nr == 0 {
+				unix.Close(serverFd)
+				log.Fatalf("read but server closed")
+			}
+
+			os.Stdout.Write(socketToInBuf[:nr])
+
+			// if nReady--; nReady <= 0 {
+			// 	continue
+			// }
+		}
+
+		// write to server
+		if pollFds[1].Revents&unix.POLLIN == unix.POLLIN {
+			nr, err := unix.Read(unix.Stdin, inToSocketBuf)
+			if err != nil {
+				log.Printf("read server error: %s", err.Error())
+				continue
+			}
+
+			if nr > 0 {
+				nw, err := unix.Write(serverFd, inToSocketBuf[:nr])
+				if err != nil && err == unix.EPIPE {
+					unix.Close(serverFd)
+					log.Fatalf("write buf server closed")
+				}
+
+				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+					if nw > 0 {
+						// write to buffer, the buffer is unlimited
+						if cap(writeBuffer) > nw {
+							copy(writeBuffer, inToSocketBuf[:nw])
+							fmt.Printf("copy %d byte to writeBuffer cap: %d\n", nw, cap(writeBuffer))
+						} else {
+							writeBuffer = append(writeBuffer, inToSocketBuf[:nw]...)
+							fmt.Printf("append %d byte to writeBuffer cap: %d\n", nw, cap(writeBuffer))
+						}
+					} else {
+						// write to buffer, the buffer is unlimited
+						writeBuffer = append(writeBuffer, inToSocketBuf[:nr]...)
+						fmt.Printf("append %d byte to writeBuffer cap: %d\n", nr, cap(writeBuffer))
+					}
+
+					// unregister stdin pollin
+					pollFds[1].Events &= ^unix.POLLIN
+					// register server socket pollout
+					pollFds[0].Events |= unix.POLLOUT
+					fmt.Println("registe poll out: ", pollFds[0].Events&unix.POLLOUT == unix.POLLOUT)
+				}
+			}
+		}
+
+		if pollFds[0].Revents&unix.POLLOUT == unix.POLLOUT {
+			fmt.Println("server is pollout")
 		}
 	}
 
@@ -264,7 +325,7 @@ func runClient(host string, port int) error {
 func main() {
 	flag.Parse()
 	mesure = util.NewMesure()
-	go mesure.Run(time.Millisecond * 500)
+	go mesure.Run(0)
 
 	if *serverAddress != "" {
 		ipv4Byte, port, err := util.ResloveEndpoint(*serverAddress)
@@ -272,7 +333,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		runServer(ipv4Byte, port)
+		log.Println(runServer(ipv4Byte, port))
 	} else if *dialAddress != "" {
 		sep := strings.Split(*dialAddress, ":")
 		if len(sep) != 2 {
