@@ -4,10 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"os"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -199,17 +196,7 @@ func runServer(ipv4 [4]byte, port int) error {
 	return nil
 }
 
-func runClient(host string, port int) error {
-	ipAddr, err := net.ResolveIPAddr("ip", host)
-	if err != nil {
-		return err
-	}
-
-	ip4 := ipAddr.IP.To4()
-	if len(ip4) != net.IPv4len {
-		return fmt.Errorf("only ipv4 address")
-	}
-
+func runClient(ipv4 [4]byte, port int) error {
 	serverFd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
 		log.Fatal(err)
@@ -217,7 +204,7 @@ func runClient(host string, port int) error {
 
 	sa := unix.SockaddrInet4{
 		Port: port,
-		Addr: [4]byte{ipAddr.IP[0], ipAddr.IP[1], ipAddr.IP[2], ipAddr.IP[3]},
+		Addr: ipv4,
 	}
 
 	if err = unix.Connect(serverFd, &sa); err != nil {
@@ -246,15 +233,16 @@ func runClient(host string, port int) error {
 	inToSocketBuf := make([]byte, 4096)
 	socketToInBuf := make([]byte, 4096)
 	writeBuffer := make([]byte, 0, 0)
-
 	for {
 		nReady, err := unix.Poll(pollFds, 1000)
 		if err != nil {
 			panic(err)
 		}
 
-		fmt.Println(nReady)
-		// server is read
+		if nReady <= 0 {
+			continue
+		}
+
 		if pollFds[0].Revents&unix.POLLIN == unix.POLLIN {
 			nr, err := unix.Read(serverFd, socketToInBuf)
 			if err != nil {
@@ -268,10 +256,9 @@ func runClient(host string, port int) error {
 			}
 
 			os.Stdout.Write(socketToInBuf[:nr])
-
-			// if nReady--; nReady <= 0 {
-			// 	continue
-			// }
+			if nReady--; nReady == 0 {
+				continue
+			}
 		}
 
 		// write to server
@@ -290,32 +277,58 @@ func runClient(host string, port int) error {
 				}
 
 				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-					if nw > 0 {
-						// write to buffer, the buffer is unlimited
-						if cap(writeBuffer) > nw {
-							copy(writeBuffer, inToSocketBuf[:nw])
-							fmt.Printf("copy %d byte to writeBuffer cap: %d\n", nw, cap(writeBuffer))
-						} else {
-							writeBuffer = append(writeBuffer, inToSocketBuf[:nw]...)
-							fmt.Printf("append %d byte to writeBuffer cap: %d\n", nw, cap(writeBuffer))
+					fmt.Println("EAGAIN")
+					if nw < len(inToSocketBuf) {
+						if nw < 0 {
+							nw = 0
 						}
-					} else {
-						// write to buffer, the buffer is unlimited
-						writeBuffer = append(writeBuffer, inToSocketBuf[:nr]...)
-						fmt.Printf("append %d byte to writeBuffer cap: %d\n", nr, cap(writeBuffer))
+						writeBuffer = append(writeBuffer, inToSocketBuf[nw:]...)
+						fmt.Printf("append %d byte to writeBuffer cap: %d\n", len(inToSocketBuf), nw)
+						// unregister stdin pollin
+						pollFds[1].Events &= ^unix.POLLIN
+						// register server socket pollout
+						pollFds[0].Events |= unix.POLLOUT
 					}
-
-					// unregister stdin pollin
-					pollFds[1].Events &= ^unix.POLLIN
-					// register server socket pollout
-					pollFds[0].Events |= unix.POLLOUT
-					fmt.Println("registe poll out: ", pollFds[0].Events&unix.POLLOUT == unix.POLLOUT)
 				}
+			}
+
+			if nReady--; nReady == 0 {
+				continue
 			}
 		}
 
 		if pollFds[0].Revents&unix.POLLOUT == unix.POLLOUT {
-			fmt.Println("server is pollout")
+			if len(writeBuffer) > 0 {
+				nw, err := unix.Write(serverFd, writeBuffer)
+				if err != nil && err == unix.EPIPE {
+					unix.Close(serverFd)
+					log.Fatalf("write buf server closed")
+				}
+
+				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+					log.Println("eagain")
+				}
+
+				if nw < len(writeBuffer) {
+					if nw < 0 {
+						nw = 0
+					}
+
+					writeBuffer = append(writeBuffer, writeBuffer[nw:]...)
+					fmt.Printf("write %d byte, remaining: %d bytes \n", nw, len(writeBuffer)-nw)
+				} else {
+					writeBuffer = make([]byte, 0, 0)
+					// unregister stdin pollin
+					pollFds[0].Events &= ^unix.POLLOUT
+					// register server socket pollout
+					pollFds[1].Events |= unix.POLLIN
+					fmt.Printf("write %d bytes \n", nw)
+				}
+			}
+
+			if nReady--; nReady == 0 {
+				continue
+			}
 		}
 	}
 
@@ -335,16 +348,11 @@ func main() {
 
 		log.Println(runServer(ipv4Byte, port))
 	} else if *dialAddress != "" {
-		sep := strings.Split(*dialAddress, ":")
-		if len(sep) != 2 {
-			log.Fatal("invalid address")
-		}
-
-		port, err := strconv.Atoi(sep[1])
+		ipv4Byte, port, err := util.ResloveEndpoint(*dialAddress)
 		if err != nil {
-			log.Fatalf("strconv.Atoid port failed: %s", err.Error())
+			log.Fatal(err)
 		}
-		runClient(sep[0], port)
+		log.Println(runClient(ipv4Byte, port))
 	}
 
 }
