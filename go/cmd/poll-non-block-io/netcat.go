@@ -16,7 +16,8 @@ var (
 	mesure        *util.Mesure
 	serverAddress = flag.String("l", "", "start server address")
 	dialAddress   = flag.String("c", "", "connect server address")
-	chargen       = flag.Bool("chargen", false, "closed server read client, client may block in write")
+	chargen       = flag.Bool("chargen", false, "control chargen on/off")
+	chargenTick   = flag.Int("chargen_tick", 10, "periodic closed server read client, client may block in write")
 )
 
 func unregisterPollFd(pollFds *[]unix.PollFd, i int) {
@@ -65,6 +66,7 @@ func writeAllClient(pollFds *[]unix.PollFd, serverFd int32, buf []byte, n int) {
 }
 
 func runServer(ipv4 [4]byte, port int) error {
+	log.Printf("listen: %s:\n\t-chargen-tick: %v", *serverAddress, *chargenTick)
 	serverFd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
 		log.Fatal(err)
@@ -98,17 +100,29 @@ func runServer(ipv4 [4]byte, port int) error {
 	nr, nw := 0, 0
 	outBuf := make([]byte, 4096)
 	inToSocketBuf := make([]byte, 4096)
-	// todo test
-	go func() {
-		time.Sleep(time.Second * 20)
-		*chargen = false
-		fmt.Println(*chargen)
-	}()
+
+	if *chargenTick > 0 {
+		go func() {
+			for {
+				<-time.Tick(time.Second * time.Duration(*chargenTick))
+				if *chargen == true {
+					*chargen = false
+					log.Printf("chargen off")
+				} else {
+					*chargen = true
+					log.Printf("chargen open")
+				}
+			}
+
+		}()
+	}
+
 	for {
-		nReady, err := unix.Poll(pollFds, 1000) // 500ms
+		nReady, err := unix.Poll(pollFds, 1000) // 1s timeout
 		if err != nil {
 			panic(err)
 		}
+
 		// accept new connection
 		if pollFds[0].Revents&unix.POLLIN == unix.POLLIN {
 			connFd, _, err := unix.Accept(serverFd)
@@ -243,24 +257,6 @@ func runClient(ipv4 [4]byte, port int) error {
 			continue
 		}
 
-		if pollFds[0].Revents&unix.POLLIN == unix.POLLIN {
-			nr, err := unix.Read(serverFd, socketToInBuf)
-			if err != nil {
-				log.Printf("read server error: %s", err.Error())
-				continue
-			}
-
-			if nr == 0 {
-				unix.Close(serverFd)
-				log.Fatalf("read but server closed")
-			}
-
-			os.Stdout.Write(socketToInBuf[:nr])
-			if nReady--; nReady == 0 {
-				continue
-			}
-		}
-
 		// write to server
 		if pollFds[1].Revents&unix.POLLIN == unix.POLLIN {
 			nr, err := unix.Read(unix.Stdin, inToSocketBuf)
@@ -283,46 +279,73 @@ func runClient(ipv4 [4]byte, port int) error {
 							nw = 0
 						}
 						writeBuffer = append(writeBuffer, inToSocketBuf[nw:]...)
-						fmt.Printf("append %d byte to writeBuffer cap: %d\n", len(inToSocketBuf), nw)
+						fmt.Printf("append %d byte to write buffer, already write : %d\n", len(inToSocketBuf), nw)
+						// register server socket pollout
+						pollFds[0].Events = unix.POLLIN | unix.POLLOUT
+
 						// unregister stdin pollin
 						pollFds[1].Events &= ^unix.POLLIN
-						// register server socket pollout
-						pollFds[0].Events |= unix.POLLOUT
+
 					}
 				}
-			}
 
-			if nReady--; nReady == 0 {
-				continue
+				fmt.Printf("write %d bytes\n", nw)
+				if nReady--; nReady <= 0 {
+					continue
+				}
 			}
 		}
 
-		if pollFds[0].Revents&unix.POLLOUT == unix.POLLOUT {
-			if len(writeBuffer) > 0 {
-				nw, err := unix.Write(serverFd, writeBuffer)
-				if err != nil && err == unix.EPIPE {
+		{
+			if pollFds[0].Revents&unix.POLLIN == unix.POLLIN {
+				nr, err := unix.Read(serverFd, socketToInBuf)
+				if err != nil {
+					log.Printf("read server error: %s", err.Error())
+					continue
+				}
+
+				if nr == 0 {
 					unix.Close(serverFd)
-					log.Fatalf("write buf server closed")
+					log.Fatalf("read but server closed")
 				}
 
-				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-					log.Println("eagain")
-				}
+				os.Stdout.Write(socketToInBuf[:nr])
+			}
 
-				if nw < len(writeBuffer) {
-					if nw < 0 {
-						nw = 0
+			if pollFds[0].Revents&unix.POLLOUT == unix.POLLOUT {
+				fmt.Println("server is poll out")
+				if len(writeBuffer) > 0 {
+					nw, err := unix.Write(serverFd, writeBuffer)
+					if err != nil && err == unix.EPIPE {
+						unix.Close(serverFd)
+						log.Fatalf("write buf server closed")
 					}
 
-					writeBuffer = append(writeBuffer, writeBuffer[nw:]...)
-					fmt.Printf("write %d byte, remaining: %d bytes \n", nw, len(writeBuffer)-nw)
-				} else {
-					writeBuffer = make([]byte, 0, 0)
-					// unregister stdin pollin
-					pollFds[0].Events &= ^unix.POLLOUT
-					// register server socket pollout
-					pollFds[1].Events |= unix.POLLIN
-					fmt.Printf("write %d bytes \n", nw)
+					if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
+						log.Println("eagain")
+					}
+
+					if nw < len(writeBuffer) {
+						if nw < 0 {
+							nw = 0
+						}
+
+						writeBuffer = append(writeBuffer, writeBuffer[nw:]...)
+						fmt.Printf("write %d byte, remaining: %d bytes \n", nw, len(writeBuffer)-nw)
+					} else {
+						writeBuffer = make([]byte, 0, 0)
+						fmt.Printf("write %d byte\n", nw)
+						// unregister pollout
+						pollFds[0].Events &= ^unix.POLLOUT
+						// register pollin
+						pollFds[1].Events = unix.POLLIN
+
+						fmt.Printf("write %d bytes \n", nw)
+					}
+				}
+
+				if nReady--; nReady == 0 {
+					continue
 				}
 			}
 
