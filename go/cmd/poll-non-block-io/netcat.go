@@ -120,7 +120,7 @@ func runServer(ipv4 [4]byte, port int) error {
 	for {
 		nReady, err := unix.Poll(pollFds, 1000) // 1s timeout
 		if err != nil {
-			panic(err)
+			panic(fmt.Errorf("err: %s, ready: %d", err.Error(), nReady))
 		}
 
 		// accept new connection
@@ -248,9 +248,9 @@ func runClient(ipv4 [4]byte, port int) error {
 	socketToInBuf := make([]byte, 4096)
 	writeBuffer := make([]byte, 0, 0)
 	for {
-		nReady, err := unix.Poll(pollFds, 1000)
-		if err != nil {
-			panic(err)
+		nReady, err := unix.Poll(pollFds, -1)
+		if err != nil && err != unix.EINTR {
+			panic(fmt.Errorf("err: %s, ready: %d", err.Error(), nReady))
 		}
 
 		if nReady <= 0 {
@@ -284,7 +284,7 @@ func runClient(ipv4 [4]byte, port int) error {
 						pollFds[0].Events = unix.POLLIN | unix.POLLOUT
 
 						// unregister stdin pollin
-						pollFds[1].Events &= ^unix.POLLIN
+						pollFds[1].Events = 0
 
 					}
 				}
@@ -336,7 +336,7 @@ func runClient(ipv4 [4]byte, port int) error {
 						writeBuffer = make([]byte, 0, 0)
 						fmt.Printf("write %d byte\n", nw)
 						// unregister pollout
-						pollFds[0].Events &= ^unix.POLLOUT
+						pollFds[0].Events = unix.POLLIN
 						// register pollin
 						pollFds[1].Events = unix.POLLIN
 
